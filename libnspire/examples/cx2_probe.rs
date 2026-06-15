@@ -1,0 +1,174 @@
+// Hardware probe for a connected TI-Nspire CX II (VID 0x0451, PID 0xe022).
+// Used to capture baseline behaviour and to validate stability changes.
+//
+// Usage:
+//   cargo run --example cx2_probe            # info + list root
+//   cargo run --example cx2_probe -- idle    # info, sleep 60s, info again
+//   cargo run --example cx2_probe -- loop 30 # poll info every 1s for 30s
+
+use std::time::{Duration, Instant};
+
+const VID: u16 = 0x0451;
+const PID_CX2: u16 = 0xe022;
+const PID: u16 = 0xe012;
+
+fn open() -> libnspire::Handle<rusb::GlobalContext> {
+    let dev = rusb::open_device_with_vid_pid(VID, PID_CX2)
+        .or_else(|| rusb::open_device_with_vid_pid(VID, PID))
+        .expect("no TI-Nspire found (looked for 0xe022 then 0xe012)");
+    libnspire::Handle::new(dev).expect("failed to init libnspire handle")
+}
+
+fn main() {
+    let mode = std::env::args().nth(1).unwrap_or_else(|| "info".to_string());
+    match mode.as_str() {
+        "info" => {
+            let handle = open();
+            match handle.info() {
+                Ok(info) => println!("INFO OK: {}", serde_json::to_string(&info).unwrap()),
+                Err(e) => println!("INFO ERR: {:?}", e),
+            }
+            match handle.list_dir("/") {
+                Ok(dir) => {
+                    println!("LIST OK: {} entries", dir.iter().count());
+                    for f in dir.iter() {
+                        println!("  {}", f.name().to_string_lossy());
+                    }
+                }
+                Err(e) => println!("LIST ERR: {:?}", e),
+            }
+        }
+        "idle" => {
+            let secs: u64 = std::env::args()
+                .nth(2)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(60);
+            let handle = open();
+            println!("before idle: {:?}", handle.info().map(|i| i.name));
+            println!("sleeping {secs}s (leave calc untouched)...");
+            std::thread::sleep(Duration::from_secs(secs));
+            let start = Instant::now();
+            let r = handle.info();
+            println!(
+                "after {secs}s idle ({}ms): {:?}",
+                start.elapsed().as_millis(),
+                r.map(|i| i.name).map_err(|e| format!("{e:?}"))
+            );
+        }
+        "loop" => {
+            let secs: u64 = std::env::args()
+                .nth(2)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30);
+            let handle = open();
+            let start = Instant::now();
+            let mut n = 0u64;
+            while start.elapsed() < Duration::from_secs(secs) {
+                n += 1;
+                match handle.info() {
+                    Ok(_) => print!("."),
+                    Err(e) => print!("[{n}:{e:?}]"),
+                }
+                use std::io::Write;
+                std::io::stdout().flush().ok();
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            println!("\ndone: {n} polls over {secs}s");
+        }
+        "pull" => {
+            // pull <calc-path> <size-bytes> [out-file]
+            let path = std::env::args().nth(2).expect("usage: pull <calc-path> <size> [out]");
+            let size: usize = std::env::args()
+                .nth(3)
+                .and_then(|s| s.parse().ok())
+                .expect("need size in bytes (from `info`/ls)");
+            let out = std::env::args().nth(4);
+            let handle = open();
+            let mut buf = vec![0u8; size];
+            let start = Instant::now();
+            let r = handle.read_file(&path, &mut buf, &mut |rem| {
+                if rem % 65536 < 4096 {
+                    print!("\r  {} / {} bytes", size - rem, size);
+                    use std::io::Write;
+                    std::io::stdout().flush().ok();
+                }
+            });
+            println!();
+            match r {
+                Ok(n) => {
+                    let cs = crc32(&buf[..n.min(buf.len())]);
+                    println!(
+                        "PULL OK: {n} bytes in {}ms crc32={cs:08x}",
+                        start.elapsed().as_millis()
+                    );
+                    if let Some(out) = out {
+                        std::fs::write(&out, &buf[..n.min(buf.len())]).unwrap();
+                        println!("wrote {out}");
+                    }
+                }
+                Err(e) => println!("PULL ERR after {}ms: {e:?}", start.elapsed().as_millis()),
+            }
+        }
+        "push" => {
+            // push <local-file> <calc-dest-dir>
+            let local = std::env::args().nth(2).expect("usage: push <local-file> <calc-dest-dir>");
+            let dest = std::env::args().nth(3).expect("usage: push <local-file> <calc-dest-dir>");
+            let buf = std::fs::read(&local).expect("read local file");
+            let name = std::path::Path::new(&local)
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
+            let full = format!("{}/{}", dest.trim_end_matches('/'), name);
+            let handle = open();
+            let start = Instant::now();
+            let r = handle.write_file(&full, &buf, &mut |rem| {
+                if rem % 65536 < 4096 {
+                    print!("\r  {} / {} bytes", buf.len() - rem, buf.len());
+                    use std::io::Write;
+                    std::io::stdout().flush().ok();
+                }
+            });
+            println!();
+            match r {
+                Ok(()) => println!(
+                    "PUSH OK: {} bytes ({}) in {}ms crc32={:08x}",
+                    buf.len(),
+                    full,
+                    start.elapsed().as_millis(),
+                    crc32(&buf)
+                ),
+                Err(e) => println!("PUSH ERR after {}ms: {e:?}", start.elapsed().as_millis()),
+            }
+        }
+        "mkdir" => {
+            let path = std::env::args().nth(2).expect("usage: mkdir <calc-path>");
+            let handle = open();
+            println!("MKDIR {path}: {:?}", handle.create_dir(&path));
+        }
+        "rm" => {
+            let path = std::env::args().nth(2).expect("usage: rm <calc-path>");
+            let handle = open();
+            println!("RM {path}: {:?}", handle.delete_file(&path));
+        }
+        "rmdir" => {
+            let path = std::env::args().nth(2).expect("usage: rmdir <calc-path>");
+            let handle = open();
+            println!("RMDIR {path}: {:?}", handle.delete_dir(&path));
+        }
+        other => println!("unknown mode: {other}"),
+    }
+}
+
+/// Tiny dependency-free CRC32 (IEEE) for integrity checks.
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+        }
+    }
+    !crc
+}
