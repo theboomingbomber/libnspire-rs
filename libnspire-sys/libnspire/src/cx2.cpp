@@ -155,6 +155,39 @@ static uint16_t compute_checksum(const uint8_t *data, uint32_t size)
 	return acc;
 }
 
+// Per-chunk timeout for the CX II bulk transfers. The original code used 1s,
+// which is too tight on a slightly flaky link or when the calculator is
+// momentarily busy, causing whole transfers to abort. 5s gives real slack.
+#define CX2_CHUNK_TIMEOUT 5000
+// How many times a single bulk chunk is retried on a zero-progress timeout
+// before giving up.
+#define CX2_CHUNK_RETRIES 4
+
+// Bounded retry around a single bulk transfer so a brief stall does not abort
+// an entire file transfer. For reads, a timeout that still moved some bytes is
+// treated as progress (return 0) so the caller can consume it and continue.
+// For writes a partial transfer means the packet was only half-sent and the
+// stream is desynced, so it is reported as an error rather than blindly resent.
+static int bulkRetry(libusb_device_handle *handle, unsigned char ep,
+		unsigned char *data, int len, int *transferred,
+		unsigned int timeout, bool allowPartial)
+{
+	int r = LIBUSB_ERROR_TIMEOUT;
+	for (int attempt = 0; attempt < CX2_CHUNK_RETRIES; attempt++) {
+		*transferred = 0;
+		r = libusb_bulk_transfer(handle, ep, data, len, transferred, timeout);
+		if (r == 0)
+			return 0;
+		if (r == LIBUSB_ERROR_TIMEOUT) {
+			if (*transferred > 0)
+				return allowPartial ? 0 : r;
+			continue; /* nothing moved: retry the whole chunk */
+		}
+		return r; /* non-transient error: fail fast */
+	}
+	return r;
+}
+
 static bool readPacket(libusb_device_handle *handle, NNSEMessage *message, int maxlen)
 {
 	if(maxlen < sizeof(NNSEMessage))
@@ -178,7 +211,8 @@ static bool readPacket(libusb_device_handle *handle, NNSEMessage *message, int m
 	auto remainingLength = completeLength - transferred;
 	while(remainingLength > 0)
 	{
-		r = libusb_bulk_transfer(handle, 0x81, data, remainingLength, &transferred, 1000);
+		r = bulkRetry(handle, 0x81, data, remainingLength, &transferred,
+			CX2_CHUNK_TIMEOUT, /*allowPartial=*/true);
 		if(r < 0)
 			return false;
 
@@ -213,7 +247,8 @@ static bool writePacket(libusb_device_handle *handle, NNSEMessage *message)
 #endif
 
 	int transferred = 0;
-	int r = libusb_bulk_transfer(handle, 0x01, reinterpret_cast<unsigned char*>(message), length, &transferred, 1000);
+	int r = bulkRetry(handle, 0x01, reinterpret_cast<unsigned char*>(message),
+		length, &transferred, CX2_CHUNK_TIMEOUT, /*allowPartial=*/false);
 	if(r < 0
 		|| length != transferred)
 		return false;

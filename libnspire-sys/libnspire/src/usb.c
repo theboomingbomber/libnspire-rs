@@ -94,13 +94,18 @@ void usb_free_device(usb_device_t *handle) {
 
 static inline int usb_xfer(libusb_device_handle *handle, unsigned char ep,
 		void *ptr, int len) {
-	int ret, transferred = 0;
-	ret = libusb_bulk_transfer(handle,
-		ep,
-		ptr,
-		len,
-		&transferred,
-		NSP_TIMEOUT);
+	int ret = LIBUSB_ERROR_TIMEOUT, transferred = 0, attempt;
+	/* Retry a whole chunk on a zero-progress timeout so a brief stall (e.g.
+	   the calculator momentarily busy) doesn't abort the entire transfer.
+	   Partial transfers keep their original semantics (return bytes left). */
+	for (attempt = 0; attempt < 4; attempt++) {
+		transferred = 0;
+		ret = libusb_bulk_transfer(handle, ep, ptr, len, &transferred,
+			NSP_TIMEOUT);
+		if (ret == LIBUSB_ERROR_TIMEOUT && transferred == 0)
+			continue;
+		break;
+	}
 
 	switch (ret) {
 	case 0:				return (len - transferred);
