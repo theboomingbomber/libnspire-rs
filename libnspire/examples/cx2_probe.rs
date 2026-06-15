@@ -6,6 +6,7 @@
 //   cargo run --example cx2_probe -- idle    # info, sleep 60s, info again
 //   cargo run --example cx2_probe -- loop 30 # poll info every 1s for 30s
 
+use std::convert::TryFrom;
 use std::time::{Duration, Instant};
 
 const VID: u16 = 0x0451;
@@ -139,6 +140,25 @@ fn main() {
                     crc32(&buf)
                 ),
                 Err(e) => println!("PUSH ERR after {}ms: {e:?}", start.elapsed().as_millis()),
+            }
+        }
+        "shot" => {
+            let out = std::env::args()
+                .nth(2)
+                .unwrap_or_else(|| "/tmp/cx2_shot.png".to_string());
+            let handle = open();
+            match handle.screenshot() {
+                Ok(img) => {
+                    println!("SCREENSHOT OK: {}x{} bpp={}", img.width, img.height, img.bpp);
+                    match image::DynamicImage::try_from(img) {
+                        Ok(di) => {
+                            di.save(&out).unwrap();
+                            println!("saved {out}");
+                        }
+                        Err(e) => println!("convert err: {e:?}"),
+                    }
+                }
+                Err(e) => println!("SCREENSHOT ERR: {e:?}"),
             }
         }
         "mkdir" => {
