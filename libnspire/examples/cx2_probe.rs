@@ -373,6 +373,26 @@ fn main() {
             handle.delete_dir("/nlfolder_test").ok();
             println!("cleaned up /nlfolder_test");
         }
+        "movetest" => {
+            let h = open();
+            let _ = h.create_dir("/mvA");
+            let _ = h.create_dir("/mvB");
+            let blob = vec![0x33u8; 1000];
+            println!("write /mvA/m.tns: {:?}", h.write_file("/mvA/m.tns", &blob, &mut |_| {}));
+            println!("move /mvA/m.tns -> /mvB/m.tns: {:?}", h.move_file("/mvA/m.tns", "/mvB/m.tns"));
+            println!("copy /mvA/m.tns -> /mvB/m.tns: {:?}", h.copy_file("/mvA/m.tns", "/mvB/m.tns"));
+            println!("after copy /mvB: {:?}", h.list_dir("/mvB").map(|d| d.iter().map(|f| f.name().to_string_lossy().to_string()).collect::<Vec<_>>()));
+            println!("delete /mvA/m.tns (the move's delete step): {:?}", h.delete_file("/mvA/m.tns"));
+            let in_a = h.list_dir("/mvA").map(|d| d.iter().map(|f| f.name().to_string_lossy().to_string()).collect::<Vec<_>>());
+            let in_b = h.list_dir("/mvB").map(|d| d.iter().map(|f| f.name().to_string_lossy().to_string()).collect::<Vec<_>>());
+            println!("/mvA now: {in_a:?}");
+            println!("/mvB now: {in_b:?}");
+            // cleanup
+            let _ = h.delete_file("/mvB/m.tns");
+            let _ = h.delete_file("/mvA/m.tns");
+            let _ = h.delete_dir("/mvA");
+            let _ = h.delete_dir("/mvB");
+        }
         "enum" => {
             // Replicate n-link's add_device() exactly to see where GUI
             // enumeration drops the device.
