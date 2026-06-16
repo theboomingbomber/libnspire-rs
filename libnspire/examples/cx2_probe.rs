@@ -7,7 +7,19 @@
 //   cargo run --example cx2_probe -- loop 30 # poll info every 1s for 30s
 
 use std::convert::TryFrom;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use rusb::{GlobalContext, Hotplug, HotplugBuilder, UsbContext};
+
+// Global lock mirroring n-link's USB_LOCK, used by the `stress` mode.
+static STRESS_LOCK: Mutex<()> = Mutex::new(());
+
+struct NullMon;
+impl Hotplug<GlobalContext> for NullMon {
+    fn device_arrived(&mut self, _: rusb::Device<GlobalContext>) {}
+    fn device_left(&mut self, _: rusb::Device<GlobalContext>) {}
+}
 
 const VID: u16 = 0x0451;
 const PID_CX2: u16 = 0xe022;
@@ -141,6 +153,55 @@ fn main() {
                 ),
                 Err(e) => println!("PUSH ERR after {}ms: {e:?}", start.elapsed().as_millis()),
             }
+        }
+        "stress" => {
+            // Reproduce n-link's hotplug-pump-vs-sync-transfer conflict.
+            //   cargo run --example cx2_probe -- stress         (no lock: should hang)
+            //   cargo run --example cx2_probe -- stress lock     (serialized: should not hang)
+            let use_lock = std::env::args().nth(2).as_deref() == Some("lock");
+            println!("stress mode, use_lock={use_lock}");
+            if rusb::has_hotplug() {
+                let reg = HotplugBuilder::new()
+                    .vendor_id(VID)
+                    .register(GlobalContext::default(), Box::new(NullMon))
+                    .unwrap();
+                std::mem::forget(reg);
+                std::thread::spawn(move || loop {
+                    if use_lock {
+                        {
+                            let _g = STRESS_LOCK.lock().unwrap();
+                            let _ = GlobalContext::default()
+                                .handle_events(Some(Duration::from_millis(50)));
+                        }
+                        std::thread::sleep(Duration::from_millis(150));
+                    } else {
+                        let _ = GlobalContext::default().handle_events(None);
+                    }
+                });
+            } else {
+                println!("no hotplug support");
+            }
+            let handle = open();
+            let start = Instant::now();
+            let mut n = 0u32;
+            while start.elapsed() < Duration::from_secs(60) {
+                n += 1;
+                let t = Instant::now();
+                let r = if use_lock {
+                    let _g = STRESS_LOCK.lock().unwrap();
+                    handle.list_dir("/")
+                } else {
+                    handle.list_dir("/")
+                };
+                println!(
+                    "op {n}: {} in {}ms",
+                    r.map(|d| format!("{} entries", d.iter().count()))
+                        .unwrap_or_else(|e| format!("{e:?}")),
+                    t.elapsed().as_millis()
+                );
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            println!("DONE: {n} ops over 60s with no hang");
         }
         "enum" => {
             // Replicate n-link's add_device() exactly to see where GUI
