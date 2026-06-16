@@ -142,6 +142,49 @@ fn main() {
                 Err(e) => println!("PUSH ERR after {}ms: {e:?}", start.elapsed().as_millis()),
             }
         }
+        "enum" => {
+            // Replicate n-link's add_device() exactly to see where GUI
+            // enumeration drops the device.
+            for dev in rusb::devices().unwrap().iter() {
+                let d = match dev.device_descriptor() {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                if d.vendor_id() != VID || !matches!(d.product_id(), PID_CX2 | PID) {
+                    continue;
+                }
+                println!(
+                    "found {:04x}:{:04x} bus {} addr {}",
+                    d.vendor_id(),
+                    d.product_id(),
+                    dev.bus_number(),
+                    dev.address()
+                );
+                match dev.open() {
+                    Ok(h) => {
+                        println!("  open: OK");
+                        match h.read_languages(Duration::from_millis(100)) {
+                            Ok(langs) => {
+                                println!("  languages: {:?}", langs);
+                                match langs.first() {
+                                    Some(l) => match h.read_product_string(
+                                        *l,
+                                        &d,
+                                        Duration::from_millis(100),
+                                    ) {
+                                        Ok(s) => println!("  product_string: {s:?}"),
+                                        Err(e) => println!("  read_product_string ERR: {e:?}"),
+                                    },
+                                    None => println!("  NO LANGUAGES -> langs[0] would PANIC"),
+                                }
+                            }
+                            Err(e) => println!("  read_languages ERR: {e:?}"),
+                        }
+                    }
+                    Err(e) => println!("  open ERR: {e:?}"),
+                }
+            }
+        }
         "shot" => {
             let out = std::env::args()
                 .nth(2)
