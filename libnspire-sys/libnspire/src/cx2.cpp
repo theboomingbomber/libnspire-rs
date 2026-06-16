@@ -162,6 +162,17 @@ static uint16_t compute_checksum(const uint8_t *data, uint32_t size)
 // How many times a single bulk chunk is retried on a zero-progress timeout
 // before giving up.
 #define CX2_CHUNK_RETRIES 4
+// How long to wait for the calculator to START responding to a request. A
+// healthy CX II replies in well under a second; the original 60s meant that a
+// desynced/unresponsive link (e.g. after an interrupted operation) blocked for
+// minutes, wedging every queued operation. Fail fast instead and let the Rust
+// layer re-open the handle, which resets the stateful link protocol.
+#define CX2_RECV_TIMEOUT 3000
+// Message-level retry count for the handshake / ack-wait / stream-wait loops.
+// On a responsive calculator the wanted packet arrives in the first iteration;
+// this only bounds how long a silent calculator stalls (CX2_MSG_RETRIES *
+// CX2_RECV_TIMEOUT) before the operation fails and recovery kicks in.
+#define CX2_MSG_RETRIES 4
 
 // Bounded retry around a single bulk transfer so a brief stall does not abort
 // an entire file transfer. For reads, a timeout that still moved some bytes is
@@ -195,7 +206,7 @@ static bool readPacket(libusb_device_handle *handle, NNSEMessage *message, int m
 
 	int transferred = 0;
 	memset(message, 0, sizeof(NNSEMessage));
-	int r = libusb_bulk_transfer(handle, 0x81, reinterpret_cast<unsigned char*>(message), maxlen, &transferred, 60000);
+	int r = libusb_bulk_transfer(handle, 0x81, reinterpret_cast<unsigned char*>(message), maxlen, &transferred, CX2_RECV_TIMEOUT);
 
 	if(r < 0
 		|| transferred < sizeof(NNSEMessage))
@@ -416,7 +427,7 @@ static bool assureReady(struct nspire_handle *nsp_handle)
 
 	const int maxlen = sizeof(NNSEMessage) + 1472;
 	NNSEMessage * const message = reinterpret_cast<NNSEMessage*>(malloc(maxlen));
-	for(int i = 10; i-- && !nsp_handle->cx2_handshake_complete;)
+	for(int i = CX2_MSG_RETRIES; i-- && !nsp_handle->cx2_handshake_complete;)
 	{
 		if(!readPacket(handle, message, maxlen))
 			continue;
@@ -456,7 +467,7 @@ int packet_send_cx2(struct nspire_handle *nsp_handle, char *data, int size)
 		NNSEMessage * const message = reinterpret_cast<NNSEMessage*>(malloc(maxlen));
 
 		bool acked = false;
-		for(int i = 10; i-- && !ret && !acked;)
+		for(int i = CX2_MSG_RETRIES; i-- && !ret && !acked;)
 		{
 			if(!readPacket(handle, message, maxlen))
 				continue;
@@ -492,7 +503,7 @@ int packet_recv_cx2(struct nspire_handle *nsp_handle, char *data, int size)
 
 	uint8_t *streamdata = nullptr;
 	int streamsize = 0;
-	for(int i = 10; i-- && !streamdata;)
+	for(int i = CX2_MSG_RETRIES; i-- && !streamdata;)
 	{
 		if(!readPacket(handle, message, maxlen))
 			continue;
