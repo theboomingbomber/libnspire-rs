@@ -203,6 +203,91 @@ fn main() {
             }
             println!("DONE: {n} ops over 60s with no hang");
         }
+        "folder" => {
+            use std::path::Path;
+            // Mirror n-link's upload_dir/download_dir recursion to validate it.
+            fn up<C: UsbContext>(h: &libnspire::Handle<C>, local: &Path, calc: &str) {
+                match h.create_dir(calc) {
+                    Ok(()) | Err(libnspire::Error::Exists) => {}
+                    Err(e) => {
+                        println!("  mkdir {calc} ERR {e:?}");
+                        return;
+                    }
+                }
+                for entry in std::fs::read_dir(local).unwrap() {
+                    let entry = entry.unwrap();
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let child = format!("{}/{}", calc, name);
+                    if entry.file_type().unwrap().is_dir() {
+                        up(h, &entry.path(), &child);
+                    } else {
+                        let buf = std::fs::read(entry.path()).unwrap();
+                        match h.write_file(&child, &buf, &mut |_| {}) {
+                            Ok(()) => println!("  up {child}: {} bytes", buf.len()),
+                            Err(e) => println!("  up {child} ERR {e:?}"),
+                        }
+                    }
+                }
+            }
+            fn down<C: UsbContext>(h: &libnspire::Handle<C>, calc: &str, local: &Path) {
+                std::fs::create_dir_all(local).unwrap();
+                let dir = match h.list_dir(calc) {
+                    Ok(d) => d,
+                    Err(e) => {
+                        println!("  list {calc} ERR {e:?}");
+                        return;
+                    }
+                };
+                let entries: Vec<(String, bool, u64)> = dir
+                    .iter()
+                    .map(|f| {
+                        (
+                            f.name().to_string_lossy().to_string(),
+                            f.entry_type() == libnspire::dir::EntryType::Directory,
+                            f.size(),
+                        )
+                    })
+                    .collect();
+                drop(dir);
+                for (name, is_dir, size) in entries {
+                    let child = format!("{}/{}", calc, name);
+                    let child_local = local.join(&name);
+                    if is_dir {
+                        down(h, &child, &child_local);
+                    } else {
+                        let mut buf = vec![0u8; size as usize];
+                        match h.read_file(&child, &mut buf, &mut |_| {}) {
+                            Ok(n) => {
+                                std::fs::write(&child_local, &buf[..n.min(buf.len())]).unwrap();
+                                println!("  down {child}: {n} bytes");
+                            }
+                            Err(e) => println!("  down {child} ERR {e:?}"),
+                        }
+                    }
+                }
+            }
+            let root = Path::new("/tmp/nlfolder_test");
+            std::fs::remove_dir_all(root).ok();
+            std::fs::create_dir_all(root.join("sub")).unwrap();
+            std::fs::write(root.join("a.tns"), b"hello-folder-a").unwrap();
+            std::fs::write(root.join("sub").join("b.tns"), vec![0x42u8; 4096]).unwrap();
+            let handle = open();
+            println!("=== upload local tree -> /nlfolder_test ===");
+            up(&handle, root, "/nlfolder_test");
+            println!("=== download /nlfolder_test -> /tmp/nlfolder_back ===");
+            let back = Path::new("/tmp/nlfolder_back");
+            std::fs::remove_dir_all(back).ok();
+            down(&handle, "/nlfolder_test", back);
+            let cmp = |p: &str| std::fs::read(root.join(p)).ok() == std::fs::read(back.join(p)).ok();
+            println!("a.tns match:     {}", cmp("a.tns"));
+            println!("sub/b.tns match: {}", cmp("sub/b.tns"));
+            // cleanup calc
+            handle.delete_file("/nlfolder_test/a.tns").ok();
+            handle.delete_file("/nlfolder_test/sub/b.tns").ok();
+            handle.delete_dir("/nlfolder_test/sub").ok();
+            handle.delete_dir("/nlfolder_test").ok();
+            println!("cleaned up /nlfolder_test");
+        }
         "enum" => {
             // Replicate n-link's add_device() exactly to see where GUI
             // enumeration drops the device.
