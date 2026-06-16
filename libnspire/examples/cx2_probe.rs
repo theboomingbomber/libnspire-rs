@@ -26,10 +26,23 @@ const PID_CX2: u16 = 0xe022;
 const PID: u16 = 0xe012;
 
 fn open() -> libnspire::Handle<rusb::GlobalContext> {
-    let dev = rusb::open_device_with_vid_pid(VID, PID_CX2)
-        .or_else(|| rusb::open_device_with_vid_pid(VID, PID))
-        .expect("no TI-Nspire found (looked for 0xe022 then 0xe012)");
-    libnspire::Handle::new(dev).expect("failed to init libnspire handle")
+    // Retry: a libusb_reset_device during init can briefly re-enumerate the
+    // device, so the first open after another process exited may transiently
+    // fail with NoDevice.
+    let mut last = String::new();
+    for attempt in 0..10 {
+        let dev = rusb::open_device_with_vid_pid(VID, PID_CX2)
+            .or_else(|| rusb::open_device_with_vid_pid(VID, PID));
+        match dev {
+            Some(dev) => match libnspire::Handle::new(dev) {
+                Ok(h) => return h,
+                Err(e) => last = format!("{e:?}"),
+            },
+            None => last = "no device".into(),
+        }
+        std::thread::sleep(Duration::from_millis(300 * (attempt + 1)));
+    }
+    panic!("failed to open TI-Nspire after retries: {}", last);
 }
 
 fn main() {
@@ -202,6 +215,78 @@ fn main() {
                 std::thread::sleep(Duration::from_millis(500));
             }
             println!("DONE: {n} ops over 60s with no hang");
+        }
+        "thrash" => {
+            // Mimic the GUI under rapid clicking: hotplug event pump (serialized
+            // by a lock, like n-link) + a fast mix of list_dir/info with no
+            // pauses, to try to reproduce the protocol desync.
+            let mode = std::env::args().nth(2).unwrap_or_default();
+            let use_lock = mode != "nolock";
+            let use_pump = mode != "nopump";
+            let secs: u64 = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(60);
+            println!("thrash use_lock={use_lock} use_pump={use_pump} for {secs}s");
+            // Open FIRST (one reset), then start the pump, so the pump/reset race
+            // on open doesn't muddy the browsing-desync test.
+            let handle = open();
+            let mut dirs = vec!["/".to_string()];
+            if let Ok(d) = handle.list_dir("/") {
+                for f in d.iter().take(6) {
+                    if f.entry_type() == libnspire::dir::EntryType::Directory {
+                        dirs.push(format!("/{}", f.name().to_string_lossy()));
+                    }
+                }
+            }
+            if use_pump && rusb::has_hotplug() {
+                let reg = HotplugBuilder::new()
+                    .vendor_id(VID)
+                    .register(GlobalContext::default(), Box::new(NullMon))
+                    .unwrap();
+                std::mem::forget(reg);
+                std::thread::spawn(move || loop {
+                    if use_lock {
+                        {
+                            let _g = STRESS_LOCK.lock().unwrap();
+                            let _ = GlobalContext::default()
+                                .handle_events(Some(Duration::from_millis(50)));
+                        }
+                        std::thread::sleep(Duration::from_millis(150));
+                    } else {
+                        let _ = GlobalContext::default().handle_events(None);
+                    }
+                });
+            }
+            println!("navigating among: {dirs:?}");
+            // Ensure a scratch dir exists for the mutation cycle.
+            { let _g = STRESS_LOCK.lock().unwrap(); let _ = handle.create_dir("/nlthrash"); }
+            let blob = vec![0x5Au8; 8000];
+            let start = Instant::now();
+            let (mut n, mut errs, mut first_err_at) = (0u64, 0u64, 0u128);
+            while start.elapsed() < Duration::from_secs(secs) {
+                n += 1;
+                let r: Result<String, libnspire::Error> = {
+                    let _g = if use_lock { Some(STRESS_LOCK.lock().unwrap()) } else { None };
+                    match n % 6 {
+                        0 => handle.info().map(|_| "info".into()),
+                        // mutation sequence like upload+auto-refresh / delete
+                        2 => handle.write_file("/nlthrash/t.tns", &blob, &mut |_| {}).map(|_| "write".into()),
+                        4 => handle.delete_file("/nlthrash/t.tns").map(|_| "delete".into()),
+                        _ => {
+                            let p = &dirs[(n as usize) % dirs.len()];
+                            handle.list_dir(p).map(|d| format!("ls {p} ({} entries)", d.iter().count()))
+                        }
+                    }
+                };
+                if let Err(e) = r {
+                    errs += 1;
+                    if first_err_at == 0 { first_err_at = start.elapsed().as_millis(); }
+                    if errs <= 20 {
+                        println!("op {n} @ {}ms ERR: {e:?}", start.elapsed().as_millis());
+                    }
+                }
+                // no sleep: thrash
+            }
+            { let _g = STRESS_LOCK.lock().unwrap(); let _ = handle.delete_file("/nlthrash/t.tns"); let _ = handle.delete_dir("/nlthrash"); }
+            println!("\nDONE: {n} ops, {errs} errors over {secs}s (first err @ {first_err_at}ms)");
         }
         "folder" => {
             use std::path::Path;
