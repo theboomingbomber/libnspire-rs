@@ -63,10 +63,12 @@ static void rle_decode(const uint8_t bpp, uint8_t *in, uint8_t *out,
 int nspire_screenshot(nspire_handle_t *handle, struct nspire_image **ptr) {
 	int ret;
 	size_t len, in_len, out_len;
-	uint8_t buffer[packet_max_datasize(handle)], bpp, *tmp = NULL, *tmp_ptr = NULL;
+	/* MSVC does not support VLAs; 1440 is the protocol-wide data maximum. */
+	uint8_t buffer[1440], bpp, *tmp = NULL, *tmp_ptr = NULL;
 	uint16_t width, height;
 	uint32_t size;
 	struct nspire_image *i;
+	const size_t buffer_size = packet_max_datasize(handle);
 
 
 	if ( (ret = service_connect(handle, 0x4024)) )
@@ -75,10 +77,10 @@ int nspire_screenshot(nspire_handle_t *handle, struct nspire_image **ptr) {
 	if ( (ret = data_write8(handle, 0x00)) )
 		return ret;
 
-	if ( (ret = data_read(handle, buffer, sizeof(buffer), NULL)) )
+	if ( (ret = data_read(handle, buffer, buffer_size, NULL)) )
 		goto end;
 
-	if ( (ret = data_scan("bwhhhhbb", buffer, sizeof(buffer),
+	if ( (ret = data_scan("bwhhhhbb", buffer, buffer_size,
 			NULL, &size, NULL, NULL, &width, &height, &bpp, NULL)) )
 		goto end;
 
@@ -101,10 +103,10 @@ int nspire_screenshot(nspire_handle_t *handle, struct nspire_image **ptr) {
 	i->height = height;
 	i->bpp = bpp;
 
-	const size_t maxsize = packet_max_datasize(handle) - 1;
+	const size_t maxsize = buffer_size - 1;
 
 	while (size) {
-		if ( (ret = data_read(handle, buffer, sizeof(buffer), NULL)) )
+		if ( (ret = data_read(handle, buffer, buffer_size, NULL)) )
 			goto error_free;
 
 		len = maxsize < size ? maxsize : size;
