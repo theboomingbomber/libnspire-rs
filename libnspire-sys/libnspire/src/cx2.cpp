@@ -167,7 +167,7 @@ static uint16_t compute_checksum(const uint8_t *data, uint32_t size)
 // desynced/unresponsive link (e.g. after an interrupted operation) blocked for
 // minutes, wedging every queued operation. Fail fast instead and let the Rust
 // layer re-open the handle, which resets the stateful link protocol.
-#define CX2_RECV_TIMEOUT 3000
+#define CX2_RECV_TIMEOUT 10000
 // Message-level retry count for the handshake / ack-wait / stream-wait loops.
 // On a responsive calculator the wanted packet arrives in the first iteration;
 // this only bounds how long a silent calculator stalls (CX2_MSG_RETRIES *
@@ -339,18 +339,17 @@ static void handlePacket(struct nspire_handle *nsp_handle, NNSEMessage *message,
 			printf("Got request from client %s (product id %c%c)\n", &req->clientID[12], req->clientID[10], req->clientID[11]);
 #endif
 
-			NNSEMessage_AddrResp resp = {};
-			resp.hdr.service = message->service;
-			resp.addr = AddrCalc;
-
-			if(!sendMessage(handle, resp))
-				printf("Failed to send message\n");
-
 			NNSEMessage_AddrResp resp2 = {};
 			resp2.hdr.service = message->service;
 			resp2.addr = 0x80; // No idea
 
-			if(!sendMessage(handle, resp2))
+			/* The CX II can ignore the first address response after reconnecting.
+			 * Sending the AddrCalc response first can also prevent the following
+			 * time request from completing.  The published libnspire-sys 0.3.4
+			 * handshake therefore sends only this response, twice. */
+			const bool first_sent = sendMessage(handle, resp2);
+			const bool second_sent = sendMessage(handle, resp2);
+			if(!first_sent || !second_sent)
 				printf("Failed to send message\n");
 
 			break;
